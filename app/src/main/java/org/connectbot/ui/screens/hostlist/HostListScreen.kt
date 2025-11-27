@@ -17,6 +17,17 @@
 
 package org.connectbot.ui.screens.hostlist
 
+import android.app.Activity
+import android.content.ComponentName
+import android.content.Intent
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.Drawable
+import android.net.Uri
+import android.os.Build
+import android.util.Log
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -78,6 +89,10 @@ import org.connectbot.ui.LocalTerminalManager
 import org.connectbot.ui.ScreenPreviews
 import org.connectbot.ui.theme.ConnectBotTheme
 import androidx.core.graphics.toColorInt
+import org.connectbot.ui.MainActivity
+import androidx.core.content.ContextCompat
+
+private const val TAG = "HostListScreen"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -95,8 +110,8 @@ fun HostListScreen(
     val terminalManager = LocalTerminalManager.current
     val viewModel = remember { HostListViewModel(context, terminalManager) }
     val uiState by viewModel.uiState.collectAsState()
-
-    // Show errors as Toast notifications
+	
+	// Show errors as Toast notifications
     LaunchedEffect(uiState.error) {
         uiState.error?.let { errorMessage ->
             Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
@@ -136,9 +151,109 @@ fun HostListScreenContent(
     onDisconnectAll: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val activity = context as? Activity
+    val makingShortcut = activity?.intent?.action == Intent.ACTION_CREATE_SHORTCUT ||
+            activity?.intent?.action == Intent.ACTION_PICK
+
     var showMenu by remember { mutableStateOf(false) }
     var showDisconnectAllDialog by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // Helper: build an explicit Intent that targets MainActivity and contains the host URI
+    fun buildHostShortcutIntent(host: Host): Intent {
+        val userPart = if (host.username.isNullOrBlank()) "" else "${Uri.encode(host.username)}@"
+        val uri = "${host.protocol}://${userPart}${Uri.encode(host.hostname)}:${host.port}/#${Uri.encode(host.nickname)}"
+
+        // Explicitly target MainActivity. Launchers often require explicit component Intents for shortcuts.
+        return Intent(Intent.ACTION_VIEW, Uri.parse(uri)).apply {
+            component = ComponentName(context, MainActivity::class.java)
+            addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+    }
+
+    // Convert drawable resource to Bitmap for EXTRA_SHORTCUT_ICON compatibility
+    fun iconResourceToBitmap(): Bitmap? {
+        try {
+            val drawable: Drawable? = ContextCompat.getDrawable(context, R.mipmap.icon)
+            if (drawable == null) return null
+
+            val width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 48
+            val height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 48
+
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            drawable.setBounds(0, 0, canvas.width, canvas.height)
+            drawable.draw(canvas)
+            return bitmap
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to convert icon resource to bitmap", t)
+            return null
+        }
+    }
+
+    // Create pinned shortcut (modern) or return legacy result + broadcast
+    fun createPinnedOrLegacyShortcut(host: Host) {
+        val shortcutIntent = buildHostShortcutIntent(host)
+        Log.d(TAG, "createPinnedOrLegacyShortcut for host=${host.nickname} makingShortcut=$makingShortcut intent=$shortcutIntent")
+
+        try {
+            // Modern pinned shortcuts (API 26+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val sm = context.getSystemService(ShortcutManager::class.java)
+                if (sm != null && sm.isRequestPinShortcutSupported) {
+                    val icon = android.graphics.drawable.Icon.createWithResource(context, R.mipmap.icon)
+                    val shortcut = ShortcutInfo.Builder(context, "connectbot_shortcut_${host.id}")
+                        .setShortLabel(host.nickname)
+                        .setIntent(shortcutIntent)
+                        .setIcon(icon)
+                        .build()
+
+                    sm.requestPinShortcut(shortcut, null)
+                    Log.d(TAG, "Requested pin shortcut (modern API) for host=${host.nickname}")
+                    activity?.finish()
+                    return
+                }
+            }
+
+            // Legacy: return shortcut as activity result (for launchers that called startActivityForResult)
+            val result = Intent().apply {
+                putExtra(Intent.EXTRA_SHORTCUT_INTENT, shortcutIntent)
+                putExtra(Intent.EXTRA_SHORTCUT_NAME, host.nickname)
+                putExtra(
+                    Intent.EXTRA_SHORTCUT_ICON_RESOURCE,
+                    Intent.ShortcutIconResource.fromContext(context, R.mipmap.icon)
+                )
+                iconResourceToBitmap()?.let { putExtra(Intent.EXTRA_SHORTCUT_ICON, it) }
+            }
+
+            Log.d(TAG, "Returning shortcut result for host=${host.nickname} extras=${result.extras}")
+            activity?.setResult(Activity.RESULT_OK, result)
+
+            // Also broadcast INSTALL_SHORTCUT as another fallback for launchers like Trebuchet
+            val install = Intent("com.android.launcher.action.INSTALL_SHORTCUT").apply {
+                putExtra(Intent.EXTRA_SHORTCUT_INTENT, shortcutIntent)
+                putExtra(Intent.EXTRA_SHORTCUT_NAME, host.nickname)
+                putExtra(
+                    Intent.EXTRA_SHORTCUT_ICON_RESOURCE,
+                    Intent.ShortcutIconResource.fromContext(context, R.mipmap.icon)
+                )
+                iconResourceToBitmap()?.let { putExtra(Intent.EXTRA_SHORTCUT_ICON, it) }
+            }
+
+            try {
+                context.sendBroadcast(install, "com.android.launcher.permission.INSTALL_SHORTCUT")
+                Log.d(TAG, "Sent INSTALL_SHORTCUT broadcast for host=${host.nickname}")
+            } catch (se: SecurityException) {
+                Log.w(TAG, "INSTALL_SHORTCUT broadcast rejected", se)
+            }
+
+            // Finish so launcher can process the result
+            activity?.finish()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to create shortcut for host=${host.nickname}", t)
+        }
+    }
 
     // Show snackbar when there's an error
     LaunchedEffect(uiState.error) {
@@ -268,7 +383,11 @@ fun HostListScreenContent(
                                 host = host,
                                 connectionState = uiState.connectionStates[host.id] ?: ConnectionState.UNKNOWN,
                                 onClick = {
-                                    onNavigateToConsole(host)
+                                    if (makingShortcut) {
+                                        createPinnedOrLegacyShortcut(host)
+                                    } else {
+                                        onNavigateToConsole(host)
+                                    }
                                 },
                                 onEdit = { onNavigateToEditHost(host) },
                                 onPortForwards = { onNavigateToPortForwards(host) },
@@ -298,8 +417,7 @@ fun HostListScreenContent(
                 }
             },
             dismissButton = {
-                TextButton(
-                    onClick = { showDisconnectAllDialog = false }
+                TextButton(onClick = { showDisconnectAllDialog = false }
                 ) {
                     Text(stringResource(R.string.disconnect_all_neg))
                 }

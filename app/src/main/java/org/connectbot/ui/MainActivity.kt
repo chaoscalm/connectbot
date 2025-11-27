@@ -62,6 +62,7 @@ class MainActivity : ComponentActivity() {
     private var terminalManager: TerminalManager? by mutableStateOf(null)
     private var bound = false
     private var requestedUri: Uri? by mutableStateOf(null)
+    private var requestedCreateShortcut: Boolean by mutableStateOf(false)
     private var navController: NavController? = null
 
     private val connection = object : ServiceConnection {
@@ -83,6 +84,8 @@ class MainActivity : ComponentActivity() {
 
         if (savedInstanceState == null) {
             requestedUri = intent?.data
+            requestedCreateShortcut = intent?.action == Intent.ACTION_CREATE_SHORTCUT ||
+                    intent?.action == Intent.ACTION_PICK
             handleIntent(intent)
         } else {
             savedInstanceState.getString(STATE_SELECTED_URI)?.let {
@@ -116,10 +119,20 @@ class MainActivity : ComponentActivity() {
                                 navController = controller
 
                                 // Handle pending URI when both terminalManager and navController are ready
-                                LaunchedEffect(requestedUri, terminalManager) {
+                                LaunchedEffect(requestedUri, requestedCreateShortcut, terminalManager) {
+                                    // handle ACTION_VIEW connection URIs
                                     requestedUri?.let { uri ->
                                         handleConnectionUri(uri)
                                         requestedUri = null
+                                    }
+
+                                    // If launched for CREATE_SHORTCUT / PICK, ensure the host list is visible
+                                    if (requestedCreateShortcut && navController != null) {
+                                        // navigate to host list so the composable can detect the create-shortcut intent
+                                        navController?.navigate(NavDestinations.HOST_LIST) {
+                                            launchSingleTop = true
+                                        }
+                                        requestedCreateShortcut = false
                                     }
                                 }
 
@@ -153,6 +166,18 @@ class MainActivity : ComponentActivity() {
 
         intent.data?.let { uri ->
             requestedUri = uri
+        }
+
+        // if launcher re-targeted the running activity to create a shortcut,
+        // remember that and navigate to host list when the NavController is ready.
+        requestedCreateShortcut = intent.action == Intent.ACTION_CREATE_SHORTCUT ||
+                intent.action == Intent.ACTION_PICK
+
+        // If navController is already available, navigate immediately to HostList so the composable sees the intent
+        if (requestedCreateShortcut) {
+            navController?.navigate(NavDestinations.HOST_LIST) {
+                launchSingleTop = true
+            }
         }
     }
 
